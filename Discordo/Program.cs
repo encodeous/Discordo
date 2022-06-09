@@ -1,31 +1,162 @@
-﻿
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Reflection;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Discordo;
+using Discordo.Covid;
+using Discordo.Data;
 using DSharpPlus;
 using DSharpPlus.Entities;
 using Flurl.Http;
+using Humanizer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using org.matheval;
 
 var client = new DiscordClient(new DiscordConfiguration()
 {
-    Token = File.ReadAllText(@"D:\encodeous\Discordo\Discordo\bin\Debug\net6.0\token.txt"),
+    Token = File.ReadAllText(Path.Combine(new FileInfo(Process.GetCurrentProcess().MainModule.FileName).Directory.FullName, "token.txt")),
     Intents = DiscordIntents.All,
     TokenType = TokenType.Bot
 });
 
-CovidStat covidData = null;
+var logger = client.Logger;
 
-if (File.Exists("covid.json"))
+void ScanUserActivities()
 {
-    covidData = JsonSerializer.Deserialize<CovidStat>(File.ReadAllText("covid.json"));
+    var dbAccess = new Database();
+    foreach (var guild in client.Guilds.Values)
+    {
+        foreach (var member in guild.Members.Values)
+        {
+            if (member.Presence != null && member.Presence.Activities.Any() && !member.IsBot)
+            {
+                foreach (var activity in member.Presence.Activities)
+                {
+                    // the user has an activity
+                    if(activity.Name == "Custom Status") continue;
+                    dbAccess.Activities.Add(new ActivityRecord()
+                    {
+                        ActivityName = activity.Name,
+                        UserId = member.Id
+                    });
+                }
+            }
+        }
+    }
+    dbAccess.SaveChanges();
 }
-else
+
+Leaderboard GenerateLeaderboard()
 {
-    covidData = await "https://api.opencovid.ca/timeseries".GetJsonAsync<CovidStat>();
-    File.WriteAllText("covid.json", JsonSerializer.Serialize(covidData));
+    List<(string, ActivityInfo)> topUsers = new();
+    Dictionary<string, TimeSpan> applications = new();
+    foreach (var guild in client.Guilds.Values)
+    {
+        foreach (var member in guild.Members.Values)
+        {
+            var userActivity = GetUserActivity(member.Id);
+            if (userActivity.Activities.Count == 0) continue;
+            topUsers.Add((member.Username, userActivity.Activities[0]));
+            foreach (var activity in userActivity.Activities)
+            {
+                if(!applications.ContainsKey(activity.ActivityName))
+                    applications[activity.ActivityName] = TimeSpan.Zero;
+                applications[activity.ActivityName] += activity.TotalTimeUse;
+            }
+        }
+    }
+    topUsers.Sort((o1, o2) =>
+        -o1.Item2.TotalTimeUse.CompareTo(o2.Item2.TotalTimeUse));
+    var lb = new Leaderboard();
+    lb.Top10Users = topUsers.Take(15);
+    lb.Top10Applications = (from x in applications
+        orderby x.Value descending
+        select (x.Key, x.Value)).Take(15);
+    return lb;
 }
+
+UserActivity GetUserActivity(ulong id)
+{
+    var dbAccess = new Database();
+    var userEntries = (from x in dbAccess.Activities
+        where x.UserId == id
+        select x).ToList();
+    var userActivities = from x in userEntries
+        group x by x.ActivityName
+        into activityGroup
+        select activityGroup;
+    var userActivity = new UserActivity();
+    userActivity.Activities = new List<ActivityInfo>();
+    userActivity.Id = id;
+    foreach (var activity in userActivities)
+    {
+        string name = activity.Key;
+        var samples = from x in activity
+            orderby x.TimeAdded descending
+            select x;
+        var prevTime = DateTime.UtcNow;
+        int sampleCount = 0;
+        int totalSampleCount = 0;
+        foreach (var cur in samples)
+        {
+            var newTime = cur.TimeAdded;
+            if (prevTime - newTime <= TimeSpan.FromMinutes(2))
+            {
+                sampleCount++;
+                prevTime = DateTime.MaxValue;
+            }
+
+            totalSampleCount++;
+        }
+        userActivity.Activities.Add(new ActivityInfo()
+        {
+            ActivityName = name,
+            ConsecutiveTimeUse = TimeSpan.FromMinutes(sampleCount),
+            TotalTimeUse = TimeSpan.FromMinutes(totalSampleCount)
+        });
+    }
+    
+    userActivity.Activities.Sort((o1, o2) =>
+        -o1.TotalTimeUse.CompareTo(o2.TotalTimeUse));
+
+    return userActivity;
+}
+
+Task.Run(async () =>
+{
+    while (true)
+    {
+        ScanUserActivities();
+        await Task.Delay(TimeSpan.FromMinutes(1));
+    }
+});
+
+// make sure the database is created properly
+
+var db = new Database();
+if (db.Database.GetPendingMigrations().Any())
+{
+    logger.LogInformation("Migrating database...");
+    db.Database.Migrate();
+    db.SaveChanges();
+}
+db.Dispose();
+
+// CovidStat covidData = null;
+//
+// if (File.Exists("covid.json"))
+// {
+//     covidData = JsonSerializer.Deserialize<CovidStat>(File.ReadAllText("covid.json"));
+// }
+// else
+// {
+//     covidData = await "https://api.opencovid.ca/timeseries".GetJsonAsync<CovidStat>();
+//     File.WriteAllText("covid.json", JsonSerializer.Serialize(covidData));
+// }
 
 var cooldown = new ConcurrentDictionary<ulong, DateTime>();
 
@@ -35,7 +166,7 @@ client.MessageCreated += async (_, msg) =>
     var id = msg.Author.Id;
     if (cooldown.ContainsKey(id))
     {
-        // if (DateTime.Now - cooldown[id] <= TimeSpan.FromSeconds(5)) return;
+        if (DateTime.Now - cooldown[id] <= TimeSpan.FromSeconds(5)) return;
     }
     
     cooldown[id] = DateTime.Now;
@@ -82,90 +213,97 @@ client.MessageCreated += async (_, msg) =>
             await omsg.RespondAsync($"Error while evaluating expression: `{e.Message}`");
         }
     }
-    else if (command == "covid")
+    // else if (command == "covid")
+    // {
+    //     var province = reader.next();
+    //
+    //     var result = from x in covidData.cases
+    //         where String.Equals(x.province, province, StringComparison.CurrentCultureIgnoreCase)
+    //         orderby x.GetRealDate() descending 
+    //         select x;
+    //
+    //     var today = result.First();
+    //     
+    //     await omsg.RespondAsync(new DiscordEmbedBuilder()
+    //         .WithTitle("Covid Stats Today")
+    //         .WithDescription($"Cases Today: `{today.cases}`\nTotal Cases: `{today.cumulative_cases}`")
+    //         .WithFooter($"Showing COVID stats for `{province}`")
+    //         .WithColor(DiscordColor.Blurple));
+    // }
+    // else if (command == "update")
+    // {
+    //     ScanUserActivities();
+    // }
+    else if (command == "stats")
     {
-        var province = reader.next();
-
-        var result = from x in covidData.cases
-            where x.province.ToLower() == province.ToLower()
-            orderby x.GetRealDate() descending 
-            select x;
-
-        var today = result.First();
+        var aid = reader.next();
+        ulong uid = id;
+        if (Regex.IsMatch(aid, "<@!?(\\d+)>"))
+        {
+            var matches = Regex.Match(aid, "<@!?(\\d+)>");
+            uid = ulong.Parse(matches.Groups[1].Value);
+        }
         
-        await omsg.RespondAsync(new DiscordEmbedBuilder()
-            .WithTitle("Covid Stats Today")
-            .WithDescription($"Cases Today: `{today.cases}`\nTotal Cases: `{today.cumulative_cases}`")
-            .WithFooter($"Showing COVID stats for `{province}`")
-            .WithColor(DiscordColor.Blurple));
-    }
+        var res = GetUserActivity(uid);
 
-    Console.WriteLine(msg.Author.Username + " " + msg.Message.Content);
-    // await msg.Message.RespondAsync(msg.Message.Content);
+        var sb = new StringBuilder();
+        sb.AppendLine("```");
+        var title = $"{"Activity Name".PadRight(35)} | {"Time Used".PadRight(15)}";
+        sb.AppendLine(title);
+        sb.AppendLine($"{string.Concat(Enumerable.Repeat('-', title.Length))}");
+        foreach (var activity in res.Activities)
+        {
+            sb.AppendLine(
+                $"{activity.ActivityName.Truncate(35).PadRight(35)} | {activity.TotalTimeUse.Humanize().PadRight(15)}");
+        }
+        sb.AppendLine("```");
+
+        var eb = new DiscordEmbedBuilder()
+            .WithTitle($"Showing Activity for `{uid}`")
+            .WithDescription(sb.ToString()).Build();
+        await omsg.RespondAsync(eb);
+    }
+    else if (command == "leaderboard")
+    {
+        var topUsers = new StringBuilder();
+        var topApps = new StringBuilder();
+        var lb = GenerateLeaderboard();
+        
+        {
+            topUsers.AppendLine("```");
+            var title = $"{"Time Used".PadRight(15)} | {"User".PadRight(15)} | {"Activity".PadRight(15)}";
+            topUsers.AppendLine(title);
+            topUsers.AppendLine($"{string.Concat(Enumerable.Repeat('-', title.Length))}");
+            foreach (var activity in lb.Top10Users)
+            {
+                topUsers.AppendLine(
+                    $"{TimeSpanHumanizeExtensions.Humanize(activity.Item2.TotalTimeUse).PadRight(15)} | {activity.Item1.Truncate(15).PadRight(15)} | {activity.Item2.ActivityName.Truncate(15).PadRight(15)}");
+            }
+            topUsers.AppendLine("```");
+        }
+        
+        {
+            topApps.AppendLine("```");
+            var title = $"{"Time Used".PadRight(15)} | {"Activity".PadRight(35)}";
+            topApps.AppendLine(title);
+            topApps.AppendLine($"{string.Concat(Enumerable.Repeat('-', title.Length))}");
+            foreach (var activity in lb.Top10Applications)
+            {
+                topApps.AppendLine(
+                    $"{TimeSpanHumanizeExtensions.Humanize(activity.Item2).PadRight(15)} | {activity.Item1.Truncate(35).PadRight(35)}");
+            }
+            topApps.AppendLine("```");
+        }
+
+        var eb = new DiscordEmbedBuilder()
+            .WithTitle($"Showing global activity leaderboard")
+            .AddField("Top 15 Activities (Cumulative)", topApps.ToString())
+            .AddField("Top 15 Users", topUsers.ToString())
+            .Build();
+        await omsg.RespondAsync(eb);
+    }
 };
 
 await client.ConnectAsync();
 
 await Task.Delay(-1);
-
-
-public class Case
-{
-    public string province { get; set; }
-    public string date_report { get; set; }
-    public DateOnly GetRealDate(){
-        var spl = date_report.Split("-");
-        return new DateOnly(int.Parse(spl[2]), int.Parse(spl[1]), int.Parse(spl[0]));
-    }
-    public int cases { get; set; }
-    public int cumulative_cases { get; set; }
-}
-
-public class Mortality
-{
-    public string province { get; set; }
-    public string date_death_report { get; set; }
-    public int deaths { get; set; }
-    public int cumulative_deaths { get; set; }
-}
-
-public class Recovered
-{
-    public string province { get; set; }
-    public string date_recovered { get; set; }
-    public int recovered { get; set; }
-    public int cumulative_recovered { get; set; }
-}
-
-public class Testing
-{
-    public string province { get; set; }
-    public string date_testing { get; set; }
-    public int testing { get; set; }
-    public int cumulative_testing { get; set; }
-    public string testing_info { get; set; }
-}
-
-public class Active
-{
-    public string province { get; set; }
-    public string date_active { get; set; }
-    public int cumulative_cases { get; set; }
-    public int cumulative_recovered { get; set; }
-    public int cumulative_deaths { get; set; }
-    public int active_cases { get; set; }
-    public int active_cases_change { get; set; }
-}
-
-public class CovidStat
-{
-    public List<Case> cases { get; set; }
-    public List<Mortality> mortality { get; set; }
-    public List<Recovered> recovered { get; set; }
-    public List<Testing> testing { get; set; }
-    public List<Active> active { get; set; }
-    public List<object> avaccine { get; set; }
-    public List<object> dvaccine { get; set; }
-    public List<object> cvaccine { get; set; }
-    public string deprecation_warning { get; set; }
-}
