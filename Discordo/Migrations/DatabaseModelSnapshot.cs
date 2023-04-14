@@ -16,20 +16,22 @@ namespace Discordo.Migrations
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "6.0.5");
 
-            modelBuilder.Entity("Discordo.Data.ActivityRecord", b =>
+            modelBuilder.Entity("Discordo.Data.ActivityCount", b =>
                 {
-                    b.Property<long>("TimeKey")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
+                    b.Property<string>("ActivityKey")
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ActivityName")
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<uint>("Minutes")
+                        .HasColumnType("INTEGER");
+
                     b.Property<ulong>("UserId")
                         .HasColumnType("INTEGER");
 
-                    b.HasKey("TimeKey");
+                    b.HasKey("ActivityKey");
 
                     b.ToTable("Activities");
                 });
